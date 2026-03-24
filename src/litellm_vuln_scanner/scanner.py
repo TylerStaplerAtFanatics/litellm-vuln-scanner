@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import base64
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Iterator
+from typing import Any, Iterator
 
 import httpx
 
@@ -16,12 +17,10 @@ import httpx
 COMPROMISED_VERSIONS = {"1.82.7", "1.82.8"}
 
 # Window during which the compromised packages were live on PyPI.
-# Start: when v1.82.7 was first published (2026-03-23)
-# End:   conservative end of exposure window (2026-03-24 EOD UTC)
 COMPROMISE_WINDOW_START = datetime(2026, 3, 23, 0, 0, 0, tzinfo=timezone.utc)
 COMPROMISE_WINDOW_END   = datetime(2026, 3, 25, 0, 0, 0, tzinfo=timezone.utc)
 
-# Dependency files to scan in each repo
+# Dependency files to deep-scan in each repo
 DEPENDENCY_FILES = [
     "requirements.txt",
     "requirements-dev.txt",
@@ -37,108 +36,140 @@ DEPENDENCY_FILES = [
     "uv.lock",
 ]
 
-# Regex: matches litellm pin to a specific version in requirements-style files
+# Basenames used to filter broad code-search results client-side
+_DEPENDENCY_BASENAMES = {f.split("/")[-1] for f in DEPENDENCY_FILES}
+
+# Files fetched per repo via GraphQL batch queries.
+# Omits subdirectory variants (requirements/base.txt etc.) — those are
+# checked via REST fallback only when the broad files show litellm.
+_GRAPHQL_FILES = [
+    "requirements.txt",
+    "requirements-dev.txt",
+    "pyproject.toml",
+    "setup.cfg",
+    "setup.py",
+    "Pipfile",
+    "Pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+]
+
+# Repos fetched per GraphQL batch request.
+# GitHub GraphQL complexity budget is 500 000 nodes/hour; 20 repos × 9 files
+# = 180 nodes per request, well within budget.
+_GRAPHQL_BATCH_SIZE = 20
+
 _LITELLM_PIN_RE = re.compile(
     r"litellm\s*[=~^<>!]+\s*(?P<ver>[0-9]+\.[0-9]+\.[0-9]+[^\s,;\"']*)",
     re.IGNORECASE,
 )
-
-# Matches TOML-style: "litellm>=1.30.0" or litellm = ">=1.30.0"
-_LITELLM_TOML_RE = re.compile(
-    r'litellm[^"\']*["\']([^"\']+)["\']|litellm\s*[=~^<>!]+\s*([0-9][^\s,\n]+)',
-    re.IGNORECASE,
-)
-
-# poetry.lock / uv.lock block
-_LOCK_NAME_RE = re.compile(r'^name\s*=\s*"litellm"', re.MULTILINE)
 _LOCK_VERSION_RE = re.compile(r'^version\s*=\s*"(?P<ver>[^"]+)"', re.MULTILINE)
 
 
+# ── Rate limit handling ───────────────────────────────────────────────────────
+
+def _rate_limit_sleep(resp: httpx.Response) -> None:
+    """
+    Inspect GitHub rate-limit response headers and sleep as needed.
+
+    GitHub uses two rate-limit mechanisms:
+    - Primary:   X-RateLimit-Remaining / X-RateLimit-Reset (per resource bucket,
+                 e.g. 5 000 REST req/hr, 10 search req/min)
+    - Secondary: Retry-After (abuse / concurrency protection, returned on 403/429)
+
+    This function is called both as an httpx response hook (for proactive
+    primary-limit sleeping) and after detecting 403/429 (for secondary limits).
+    """
+    # Secondary rate limit: Retry-After takes absolute priority
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after and resp.status_code in (403, 429):
+        time.sleep(float(retry_after) + 1)
+        return
+
+    # Primary rate limit: sleep until reset when the bucket is exhausted
+    remaining = resp.headers.get("X-RateLimit-Remaining")
+    reset      = resp.headers.get("X-RateLimit-Reset")
+    if remaining is not None and int(remaining) == 0 and reset is not None:
+        wait = max(1.0, float(reset) - time.time() + 1)
+        time.sleep(wait)
+
+
+# ── Data models ───────────────────────────────────────────────────────────────
+
 class FindingKind(str, Enum):
-    COMPROMISED = "COMPROMISED"   # Pinned to 1.82.7 or 1.82.8
-    UNPINNED = "UNPINNED"         # Uses litellm but no upper bound — could have resolved to bad version
-    LOCKFILE = "LOCKFILE"         # Version found in a lock file
+    COMPROMISED = "COMPROMISED"
+    UNPINNED    = "UNPINNED"
+    LOCKFILE    = "LOCKFILE"
 
 
 @dataclass
 class Finding:
-    repo: str
+    repo:     str
     filepath: str
-    kind: FindingKind
-    version: str          # Exact version found, or constraint string
-    raw_line: str = ""    # The matching line(s) for context
+    kind:     FindingKind
+    version:  str
+    raw_line: str = ""
 
 
 @dataclass
 class WorkflowRunFinding:
-    """A GitHub Actions run that executed during the compromise window."""
-    repo: str
+    repo:          str
     workflow_name: str
-    run_id: int
-    run_url: str
-    started_at: datetime
-    conclusion: str | None   # "success", "failure", "cancelled", None (in-progress)
-    head_branch: str
+    run_id:        int
+    run_url:       str
+    started_at:    datetime
+    conclusion:    str | None
+    head_branch:   str
 
 
 @dataclass
 class ScanResult:
-    repo: str
-    findings: list[Finding] = field(default_factory=list)
-    scanned_files: list[str] = field(default_factory=list)
-    workflow_runs: list[WorkflowRunFinding] = field(default_factory=list)
-    error: str | None = None
+    repo:           str
+    findings:       list[Finding]            = field(default_factory=list)
+    scanned_files:  list[str]                = field(default_factory=list)
+    workflow_runs:  list[WorkflowRunFinding] = field(default_factory=list)
+    error:          str | None               = None
 
+
+# ── Content parsing ───────────────────────────────────────────────────────────
 
 def _decode_content(encoded: str) -> str:
-    """Decode base64 GitHub API file content."""
     return base64.b64decode(encoded.replace("\n", "")).decode("utf-8", errors="replace")
 
 
-def _extract_versions_from_content(filepath: str, content: str) -> list[tuple[str, str]]:
-    """
-    Return list of (version_string, raw_line) tuples found in the file content.
-    version_string may be an exact version or a constraint like >=1.30.0.
-    """
+def _extract_versions(filepath: str, content: str) -> list[tuple[str, str]]:
+    """Return [(version_or_constraint, raw_line), ...] for litellm entries."""
     results: list[tuple[str, str]] = []
 
     if "poetry.lock" in filepath or "uv.lock" in filepath:
-        # Find the litellm block and extract its version
-        for block_match in re.finditer(
+        for block in re.finditer(
             r'name\s*=\s*"litellm".*?(?=\n\[\[|\n\[|\Z)', content, re.DOTALL
         ):
-            block = block_match.group()
-            ver_match = _LOCK_VERSION_RE.search(block)
-            if ver_match:
-                results.append((ver_match.group("ver"), block[:120]))
+            ver = _LOCK_VERSION_RE.search(block.group())
+            if ver:
+                results.append((ver.group("ver"), block.group()[:120]))
     else:
         for line in content.splitlines():
             if "litellm" not in line.lower():
                 continue
             m = _LITELLM_PIN_RE.search(line)
-            if m:
-                results.append((m.group("ver"), line.strip()))
-            else:
-                # Capture the line even if we can't parse an exact version
-                if re.search(r"litellm", line, re.IGNORECASE):
-                    results.append(("(unparsed)", line.strip()))
+            results.append((m.group("ver") if m else "(unparsed)", line.strip()))
 
     return results
 
 
-def _classify_version(version: str) -> FindingKind:
-    """Classify a version string into a FindingKind."""
-    # Strip constraint operators to get base version
+def _classify(version: str) -> FindingKind:
     clean = re.sub(r"[=~^<>!]", "", version).strip().split(",")[0]
-    if clean in COMPROMISED_VERSIONS:
-        return FindingKind.COMPROMISED
-    return FindingKind.UNPINNED
+    return FindingKind.COMPROMISED if clean in COMPROMISED_VERSIONS else FindingKind.UNPINNED
 
+
+# ── Scanner ───────────────────────────────────────────────────────────────────
 
 class GitHubScanner:
     """Scans GitHub repositories for compromised litellm versions."""
 
     def __init__(self, token: str, timeout: float = 30.0):
+        self._token = token
         self._client = httpx.Client(
             base_url="https://api.github.com",
             headers={
@@ -147,6 +178,8 @@ class GitHubScanner:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             timeout=timeout,
+            # Proactively sleep when the primary rate-limit bucket is exhausted
+            event_hooks={"response": [_rate_limit_sleep]},
         )
 
     def close(self):
@@ -158,16 +191,59 @@ class GitHubScanner:
     def __exit__(self, *_):
         self.close()
 
+    # ── Low-level request helpers ─────────────────────────────────────────────
+
+    def _get(self, url: str, **kwargs) -> httpx.Response:
+        """
+        GET with automatic retry on secondary rate limits (403/429 + Retry-After).
+        The primary rate-limit hook handles sleep before we see the response;
+        this loop handles the retry after secondary-limit sleeps.
+        """
+        while True:
+            resp = self._client.get(url, **kwargs)
+            if resp.status_code in (403, 429) and resp.headers.get("Retry-After"):
+                # Hook already slept; retry
+                continue
+            return resp
+
+    def _graphql(self, query: str, variables: dict | None = None) -> dict:
+        """
+        Execute a GitHub GraphQL query. Retries on secondary rate limits.
+        Returns the 'data' dict from the response.
+        """
+        payload: dict[str, Any] = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        while True:
+            resp = httpx.post(
+                "https://api.github.com/graphql",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=60.0,
+            )
+            _rate_limit_sleep(resp)
+            if resp.status_code in (403, 429) and resp.headers.get("Retry-After"):
+                continue
+            resp.raise_for_status()
+            body = resp.json()
+            if "errors" in body:
+                # Surface GraphQL errors but don't crash — caller handles None data
+                raise httpx.HTTPStatusError(
+                    str(body["errors"]), request=resp.request, response=resp
+                )
+            return body.get("data", {})
+
     # ── Repo listing ──────────────────────────────────────────────────────────
 
     def iter_org_repos(self, org: str) -> Iterator[str]:
-        """Yield full repo names (org/repo) for all repos in an org."""
         page = 1
         while True:
-            resp = self._client.get(
-                f"/orgs/{org}/repos",
-                params={"per_page": 100, "page": page, "type": "all"},
-            )
+            resp = self._get(f"/orgs/{org}/repos",
+                             params={"per_page": 100, "page": page, "type": "all"})
             resp.raise_for_status()
             repos = resp.json()
             if not repos:
@@ -178,14 +254,12 @@ class GitHubScanner:
                 break
             page += 1
 
-    def iter_user_repos(self, username: str) -> Iterator[str]:
-        """Yield full repo names for all repos owned by a user."""
+    def iter_user_repos(self) -> Iterator[str]:
+        """Yield repos owned by the authenticated user (includes private repos)."""
         page = 1
         while True:
-            resp = self._client.get(
-                f"/users/{username}/repos",
-                params={"per_page": 100, "page": page, "type": "owner"},
-            )
+            resp = self._get("/user/repos",
+                             params={"per_page": 100, "page": page, "type": "owner"})
             resp.raise_for_status()
             repos = resp.json()
             if not repos:
@@ -196,23 +270,23 @@ class GitHubScanner:
                 break
             page += 1
 
-    # ── Code search ───────────────────────────────────────────────────────────
+    # ── Code search (REST) ────────────────────────────────────────────────────
 
     def _code_search(self, query: str) -> list[dict]:
-        """Run a paginated GitHub code search, returning raw item dicts."""
+        """Paginated GitHub code search with automatic rate-limit retry."""
         items: list[dict] = []
         page = 1
         while True:
-            resp = self._client.get(
-                "/search/code",
-                params={"q": query, "per_page": 100, "page": page},
-            )
+            resp = self._get("/search/code",
+                             params={"q": query, "per_page": 100, "page": page})
             if resp.status_code == 422:
-                break  # Query not valid for this scope
+                break
+            if resp.status_code in (403, 429):
+                # Secondary limit: hook slept, retry
+                continue
             resp.raise_for_status()
             batch = resp.json().get("items", [])
             items.extend(batch)
-            # GitHub caps code search at 1 000 results; stop when exhausted
             if len(batch) < 100:
                 break
             page += 1
@@ -222,70 +296,105 @@ class GitHubScanner:
         self, *, org: str | None = None, user: str | None = None
     ) -> set[str]:
         """
-        Return the set of repo full-names that contain 'litellm' in any
-        recognised dependency file. Uses GitHub code search across several
-        filename filters so we only deep-scan repos that actually use the package.
+        Single broad code search for 'litellm' in the given scope, filtered
+        client-side to dependency-file basenames. Issues ONE query instead of
+        one-per-filename, keeping well within the 10 req/min search rate limit.
         """
         scope = f"org:{org}" if org else f"user:{user}"
-        # Cast a wide net across the file types we care about
-        filenames = [
-            "requirements.txt",
-            "requirements-dev.txt",
-            "pyproject.toml",
-            "setup.cfg",
-            "setup.py",
-            "Pipfile",
-            "Pipfile.lock",
-            "poetry.lock",
-            "uv.lock",
-        ]
         repos: set[str] = set()
-        for fname in filenames:
-            for item in self._code_search(f"litellm filename:{fname} {scope}"):
+        for item in self._code_search(f"litellm {scope}"):
+            basename = item["path"].split("/")[-1]
+            if basename in _DEPENDENCY_BASENAMES:
                 repos.add(item["repository"]["full_name"])
         return repos
 
     def code_search_compromised(
         self, *, org: str | None = None, user: str | None = None
     ) -> list[Finding]:
-        """
-        Use GitHub code search to quickly find any exact pins to compromised versions.
-        This is faster than per-repo scanning but may miss lockfile resolutions.
-        """
+        """Fast search for exact pins to compromised versions."""
         findings: list[Finding] = []
         scope = f"org:{org}" if org else f"user:{user}"
-
         for ver in COMPROMISED_VERSIONS:
             for item in self._code_search(f"litellm=={ver} {scope}"):
-                findings.append(
-                    Finding(
-                        repo=item["repository"]["full_name"],
-                        filepath=item["path"],
-                        kind=FindingKind.COMPROMISED,
-                        version=ver,
-                        raw_line=f"litellm=={ver}",
-                    )
-                )
-
+                findings.append(Finding(
+                    repo=item["repository"]["full_name"],
+                    filepath=item["path"],
+                    kind=FindingKind.COMPROMISED,
+                    version=ver,
+                    raw_line=f"litellm=={ver}",
+                ))
         return findings
 
-    # ── Per-file scanning ─────────────────────────────────────────────────────
+    # ── GraphQL batch file fetching ───────────────────────────────────────────
 
-    def _fetch_file(self, repo: str, path: str) -> str | None:
-        """Fetch file content from GitHub. Returns decoded text or None."""
-        resp = self._client.get(f"/repos/{repo}/contents/{path}")
-        if resp.status_code == 404:
+    def _build_file_fragment(self, file_alias: str, path: str) -> str:
+        """GraphQL fragment for a single file expression."""
+        return f'{file_alias}: object(expression: "HEAD:{path}") {{ ... on Blob {{ text }} }}'
+
+    def fetch_files_batch(
+        self, repos: list[str], files: list[str] = _GRAPHQL_FILES
+    ) -> dict[str, dict[str, str | None]]:
+        """
+        Fetch dependency file contents for multiple repos in a single GraphQL
+        query, batched in groups of _GRAPHQL_BATCH_SIZE.
+
+        Returns: {repo_full_name: {filepath: content_or_None}}
+        """
+        results: dict[str, dict[str, str | None]] = {}
+
+        for i in range(0, len(repos), _GRAPHQL_BATCH_SIZE):
+            batch = repos[i : i + _GRAPHQL_BATCH_SIZE]
+            repo_fragments: list[str] = []
+
+            for j, full_name in enumerate(batch):
+                owner, name = full_name.split("/", 1)
+                # Sanitise name for use as a GraphQL alias (no hyphens/dots)
+                alias = f"r{j}"
+                file_fragments = "\n        ".join(
+                    self._build_file_fragment(f"f{k}", path)
+                    for k, path in enumerate(files)
+                )
+                repo_fragments.append(
+                    f'{alias}: repository(owner: "{owner}", name: "{name}") {{\n'
+                    f"        {file_fragments}\n"
+                    f"      }}"
+                )
+
+            query = "{\n  " + "\n  ".join(repo_fragments) + "\n}"
+
+            try:
+                data = self._graphql(query)
+            except Exception:
+                # GraphQL failed for this batch — fall back to REST for these repos
+                for full_name in batch:
+                    results[full_name] = {f: self._fetch_file_rest(full_name, f) for f in files}
+                continue
+
+            for j, full_name in enumerate(batch):
+                alias = f"r{j}"
+                repo_data = data.get(alias) or {}
+                file_map: dict[str, str | None] = {}
+                for k, path in enumerate(files):
+                    node = repo_data.get(f"f{k}") or {}
+                    file_map[path] = node.get("text")
+                results[full_name] = file_map
+
+        return results
+
+    # ── REST file fetching (fallback / subdirectory paths) ────────────────────
+
+    def _fetch_file_rest(self, repo: str, path: str) -> str | None:
+        resp = self._get(f"/repos/{repo}/contents/{path}")
+        if resp.status_code in (404, 403):
             return None
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, list):
-            return None  # It's a directory
-        encoded = data.get("content", "")
-        return _decode_content(encoded)
+            return None
+        return _decode_content(data.get("content", ""))
 
     def _list_workflow_files(self, repo: str) -> list[str]:
-        """List .yml/.yaml files under .github/workflows/."""
-        resp = self._client.get(f"/repos/{repo}/contents/.github/workflows")
+        resp = self._get(f"/repos/{repo}/contents/.github/workflows")
         if resp.status_code == 404:
             return []
         resp.raise_for_status()
@@ -301,13 +410,7 @@ class GitHubScanner:
     # ── Workflow run validation ────────────────────────────────────────────────
 
     def check_workflow_runs(self, repo: str) -> list[WorkflowRunFinding]:
-        """
-        Return any GitHub Actions runs for *repo* that started during the
-        compromise window (2026-03-23 00:00 UTC – 2026-03-25 00:00 UTC).
-
-        A workflow run during this window on a repo with an unbounded litellm
-        dependency means pip/uv may have resolved to the compromised version.
-        """
+        """Return Actions runs that started during the compromise window."""
         created_filter = (
             f"{COMPROMISE_WINDOW_START.strftime('%Y-%m-%dT%H:%M:%SZ')}"
             f".."
@@ -315,99 +418,84 @@ class GitHubScanner:
         )
         runs: list[WorkflowRunFinding] = []
         page = 1
-
         while True:
-            resp = self._client.get(
+            resp = self._get(
                 f"/repos/{repo}/actions/runs",
-                params={
-                    "created": created_filter,
-                    "per_page": 100,
-                    "page": page,
-                },
+                params={"created": created_filter, "per_page": 100, "page": page},
             )
             if resp.status_code in (403, 404):
                 break
             resp.raise_for_status()
-
-            data = resp.json()
-            batch = data.get("workflow_runs", [])
+            batch = resp.json().get("workflow_runs", [])
             if not batch:
                 break
-
             for run in batch:
-                started_raw = run.get("run_started_at") or run.get("created_at", "")
+                raw = run.get("run_started_at") or run.get("created_at", "")
                 try:
-                    started_at = datetime.fromisoformat(
-                        started_raw.replace("Z", "+00:00")
-                    )
+                    started_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
                 except (ValueError, AttributeError):
-                    started_at = COMPROMISE_WINDOW_START  # fallback
-
-                runs.append(
-                    WorkflowRunFinding(
-                        repo=repo,
-                        workflow_name=run.get("name") or run.get("display_title", ""),
-                        run_id=run["id"],
-                        run_url=run.get("html_url", ""),
-                        started_at=started_at,
-                        conclusion=run.get("conclusion"),
-                        head_branch=run.get("head_branch", ""),
-                    )
-                )
-
+                    started_at = COMPROMISE_WINDOW_START
+                runs.append(WorkflowRunFinding(
+                    repo=repo,
+                    workflow_name=run.get("name") or run.get("display_title", ""),
+                    run_id=run["id"],
+                    run_url=run.get("html_url", ""),
+                    started_at=started_at,
+                    conclusion=run.get("conclusion"),
+                    head_branch=run.get("head_branch", ""),
+                ))
             if len(batch) < 100:
                 break
             page += 1
-
         return runs
+
+    # ── Per-repo scanning ─────────────────────────────────────────────────────
+
+    def _analyze_files(
+        self, repo: str, file_map: dict[str, str | None]
+    ) -> ScanResult:
+        """Build a ScanResult from a {filepath: content} map."""
+        result = ScanResult(repo=repo)
+        for filepath, content in file_map.items():
+            if not content or "litellm" not in content.lower():
+                continue
+            result.scanned_files.append(filepath)
+            for version, raw_line in _extract_versions(filepath, content):
+                kind = _classify(version)
+                if "poetry.lock" in filepath or "uv.lock" in filepath:
+                    kind = FindingKind.LOCKFILE
+                result.findings.append(Finding(
+                    repo=repo, filepath=filepath,
+                    kind=kind, version=version, raw_line=raw_line,
+                ))
+        return result
 
     def scan_repo(self, repo: str, check_runs: bool = True) -> ScanResult:
         """
-        Scan a single repo for all known dependency file paths.
-
-        When *check_runs* is True (default), repos with COMPROMISED or UNPINNED
-        findings are also checked for GitHub Actions runs during the compromise
-        window to determine if the bad version may have been installed.
+        Scan a single repo. GraphQL is used for the main dependency files;
+        REST fills in subdirectory paths and workflow files.
+        When check_runs=True, repos with COMPROMISED or UNPINNED findings are
+        also checked for Actions runs during the compromise window.
         """
-        result = ScanResult(repo=repo)
+        # Primary: GraphQL batch fetch for standard dep files
+        batch_result = self.fetch_files_batch([repo])
+        file_map = batch_result.get(repo, {})
 
-        # Build the list of files to scan (static + dynamic workflow list)
-        files_to_scan = list(DEPENDENCY_FILES)
+        # Supplement: REST for subdirectory requirements paths + workflow files
+        extra_paths = [
+            p for p in DEPENDENCY_FILES if p not in _GRAPHQL_FILES
+        ]
         try:
-            files_to_scan.extend(self._list_workflow_files(repo))
+            extra_paths += self._list_workflow_files(repo)
         except httpx.HTTPStatusError:
             pass
 
-        for filepath in files_to_scan:
-            try:
-                content = self._fetch_file(repo, filepath)
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code not in (404, 403):
-                    result.error = str(exc)
-                continue
+        for path in extra_paths:
+            if path not in file_map:
+                file_map[path] = self._fetch_file_rest(repo, path)
 
-            if content is None or "litellm" not in content.lower():
-                continue
+        result = self._analyze_files(repo, file_map)
 
-            result.scanned_files.append(filepath)
-
-            for version, raw_line in _extract_versions_from_content(filepath, content):
-                kind = _classify_version(version)
-                # For lock files, always record the finding
-                if "poetry.lock" in filepath or "uv.lock" in filepath:
-                    kind = FindingKind.LOCKFILE
-                result.findings.append(
-                    Finding(
-                        repo=repo,
-                        filepath=filepath,
-                        kind=kind,
-                        version=version,
-                        raw_line=raw_line,
-                    )
-                )
-
-        # For repos with concerning findings, check whether CI ran during the
-        # compromise window — those runs may have pip-installed the bad version.
         if check_runs and any(
             f.kind in (FindingKind.COMPROMISED, FindingKind.UNPINNED)
             for f in result.findings
