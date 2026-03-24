@@ -196,7 +196,54 @@ class GitHubScanner:
                 break
             page += 1
 
-    # ── Code search (fast broad pass) ────────────────────────────────────────
+    # ── Code search ───────────────────────────────────────────────────────────
+
+    def _code_search(self, query: str) -> list[dict]:
+        """Run a paginated GitHub code search, returning raw item dicts."""
+        items: list[dict] = []
+        page = 1
+        while True:
+            resp = self._client.get(
+                "/search/code",
+                params={"q": query, "per_page": 100, "page": page},
+            )
+            if resp.status_code == 422:
+                break  # Query not valid for this scope
+            resp.raise_for_status()
+            batch = resp.json().get("items", [])
+            items.extend(batch)
+            # GitHub caps code search at 1 000 results; stop when exhausted
+            if len(batch) < 100:
+                break
+            page += 1
+        return items
+
+    def search_repos_with_litellm(
+        self, *, org: str | None = None, user: str | None = None
+    ) -> set[str]:
+        """
+        Return the set of repo full-names that contain 'litellm' in any
+        recognised dependency file. Uses GitHub code search across several
+        filename filters so we only deep-scan repos that actually use the package.
+        """
+        scope = f"org:{org}" if org else f"user:{user}"
+        # Cast a wide net across the file types we care about
+        filenames = [
+            "requirements.txt",
+            "requirements-dev.txt",
+            "pyproject.toml",
+            "setup.cfg",
+            "setup.py",
+            "Pipfile",
+            "Pipfile.lock",
+            "poetry.lock",
+            "uv.lock",
+        ]
+        repos: set[str] = set()
+        for fname in filenames:
+            for item in self._code_search(f"litellm filename:{fname} {scope}"):
+                repos.add(item["repository"]["full_name"])
+        return repos
 
     def code_search_compromised(
         self, *, org: str | None = None, user: str | None = None
@@ -209,16 +256,7 @@ class GitHubScanner:
         scope = f"org:{org}" if org else f"user:{user}"
 
         for ver in COMPROMISED_VERSIONS:
-            query = f"litellm=={ver} {scope}"
-            resp = self._client.get(
-                "/search/code",
-                params={"q": query, "per_page": 100},
-            )
-            if resp.status_code == 422:
-                continue  # Query not valid for this scope
-            resp.raise_for_status()
-
-            for item in resp.json().get("items", []):
+            for item in self._code_search(f"litellm=={ver} {scope}"):
                 findings.append(
                     Finding(
                         repo=item["repository"]["full_name"],

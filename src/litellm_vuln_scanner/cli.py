@@ -254,24 +254,46 @@ def scan(
             raise typer.Exit(1 if fast_findings else 0)
 
         # ── Per-repo file scan ────────────────────────────────────────────────
-        console.print("\n[bold cyan]Phase 2: Per-repo file scan (lockfiles + pyproject)...[/bold cyan]")
+        console.print("\n[bold cyan]Phase 2: Filtering repos with litellm via code search...[/bold cyan]")
 
-        repos: list[str] = []
+        repos: set[str] = set()
+        search_failed = False
+
         if org:
-            console.print(f"  Fetching repo list for org: [bold]{org}[/bold]")
+            console.print(f"  Searching org [bold]{org}[/bold] for litellm dependency files...")
             try:
-                repos.extend(scanner.iter_org_repos(org))
+                found = scanner.search_repos_with_litellm(org=org)
+                repos.update(found)
+                console.print(f"  Found [bold]{len(found)}[/bold] repo(s) referencing litellm in {org}")
             except Exception as exc:
-                err_console.print(f"[red]Failed to list repos for {org}: {exc}[/red]")
+                err_console.print(f"[yellow]Repo filter search failed for {org}: {exc} — falling back to full scan[/yellow]")
+                search_failed = True
 
         if user:
-            console.print(f"  Fetching repo list for user: [bold]{user}[/bold]")
+            console.print(f"  Searching user [bold]{user}[/bold] for litellm dependency files...")
             try:
-                repos.extend(scanner.iter_user_repos(user))
+                found = scanner.search_repos_with_litellm(user=user)
+                repos.update(found)
+                console.print(f"  Found [bold]{len(found)}[/bold] repo(s) referencing litellm for {user}")
             except Exception as exc:
-                err_console.print(f"[red]Failed to list repos for {user}: {exc}[/red]")
+                err_console.print(f"[yellow]Repo filter search failed for {user}: {exc} — falling back to full scan[/yellow]")
+                search_failed = True
 
-        console.print(f"  Scanning [bold]{len(repos)}[/bold] repos with {workers} workers...")
+        # Fall back to listing all repos if code search failed
+        if search_failed:
+            console.print("  [dim]Falling back: fetching complete repo lists...[/dim]")
+            if org:
+                try:
+                    repos.update(scanner.iter_org_repos(org))
+                except Exception as exc:
+                    err_console.print(f"[red]Failed to list repos for {org}: {exc}[/red]")
+            if user:
+                try:
+                    repos.update(scanner.iter_user_repos(user))
+                except Exception as exc:
+                    err_console.print(f"[red]Failed to list repos for {user}: {exc}[/red]")
+
+        console.print(f"\n[bold cyan]Phase 3: Deep-scanning [bold]{len(repos)}[/bold] repo(s) with {workers} workers...[/bold cyan]")
 
         results: list[ScanResult] = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
