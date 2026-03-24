@@ -23,11 +23,13 @@ For each repo with an unpinned or compromised litellm finding, this skill:
 
 ## Safe Version Constraint
 
-The recommended fix depends on context:
-- **Compromised pin** (`==1.82.7` or `==1.82.8`): upgrade to `>=1.82.9`
-- **Unpinned / unbounded** (`>=X.Y.Z` with no upper bound): add `!=1.82.7,!=1.82.8`
-- **Script install** (`uv tool install litellm[proxy]`): pin to `>=1.82.9`
-- **No constraint at all** (bare `litellm`): add `!=1.82.7,!=1.82.8`
+**`1.82.6` is the last confirmed clean version on PyPI.** No clean release after
+the attack (`1.82.9`+) exists yet — pin to `==1.82.6` in all cases.
+
+- **Compromised pin** (`==1.82.7` or `==1.82.8`): downgrade to `==1.82.6`
+- **Unpinned / unbounded** (`>=X.Y.Z` with no upper bound): pin to `==1.82.6`
+- **Script install** (`uv tool install litellm[proxy]`): pin to `==1.82.6`
+- **No constraint at all** (bare `litellm`): pin to `==1.82.6`
 
 ## Step-by-Step Workflow
 
@@ -55,42 +57,30 @@ Apply the appropriate transformation based on the file:
 #### requirements.txt / requirements-dev.txt / requirements/*.txt / setup.cfg
 
 ```bash
-# Unpinned: litellm>=1.0.0  →  litellm>=1.0.0,!=1.82.7,!=1.82.8
-sed -i 's/litellm\(>=.*\)/litellm\1,!=1.82.7,!=1.82.8/g' requirements.txt
-
-# Compromised exact pin: litellm==1.82.7  →  litellm>=1.82.9
-sed -i 's/litellm==1\.82\.[78]/litellm>=1.82.9/g' requirements.txt
-
-# Bare litellm (no version):  litellm  →  litellm!=1.82.7,!=1.82.8
-sed -i 's/^litellm$/litellm!=1.82.7,!=1.82.8/' requirements.txt
+# Any constraint  →  litellm==1.82.6
+sed -i 's/litellm[>=!<~^].*/litellm==1.82.6/' requirements.txt
+# Bare litellm
+sed -i 's/^litellm$/litellm==1.82.6/' requirements.txt
 ```
 
 #### pyproject.toml (PEP 621 dependencies array)
 
 ```bash
-# In [project] dependencies list:
-# "litellm>=1.68.0"  →  "litellm>=1.68.0,!=1.82.7,!=1.82.8"
-sed -i 's/"litellm>=\([^"]*\)"/"litellm>=\1,!=1.82.7,!=1.82.8"/g' pyproject.toml
-
-# Poetry-style [tool.poetry.dependencies]:
-# litellm = ">=1.68.0"  →  litellm = ">=1.68.0,!=1.82.7,!=1.82.8"
-sed -i 's/litellm = "\(>=.*\)"/litellm = "\1,!=1.82.7,!=1.82.8"/g' pyproject.toml
+# "litellm>=X.Y.Z"  →  "litellm==1.82.6"
+sed -i 's/"litellm[^"]*"/"litellm==1.82.6"/g' pyproject.toml
 ```
 
 #### Makefile (uv tool install)
 
 ```bash
-# uv tool install litellm[proxy]  →  uv tool install "litellm[proxy]>=1.82.9"
-sed -i 's/uv tool install litellm\(\[proxy\]\)\?/uv tool install "litellm[proxy]>=1.82.9"/g' Makefile
+# uv tool install litellm[proxy]  →  uv tool install "litellm[proxy]==1.82.6"
+sed -i 's/uv tool install litellm\(\[proxy\]\)\?/uv tool install "litellm[proxy]==1.82.6"/g' Makefile
 ```
 
 #### Pipfile
 
 ```bash
-# litellm = "*"  →  litellm = "!=1.82.7,!=1.82.8"
-# litellm = ">=1.0.0"  →  litellm = ">=1.0.0,!=1.82.7,!=1.82.8"
-sed -i 's/litellm = "\*"/litellm = "!=1.82.7,!=1.82.8"/' Pipfile
-sed -i 's/litellm = "\(>=.*\)"/litellm = "\1,!=1.82.7,!=1.82.8"/' Pipfile
+sed -i 's/litellm = "[^"]*"/litellm = "==1.82.6"/' Pipfile
 ```
 
 ### 3. Create the PR
