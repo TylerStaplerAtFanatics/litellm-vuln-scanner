@@ -433,7 +433,7 @@ def _print_results(
 @app.command()
 def scan(
     org: Optional[str] = typer.Option(None, "--org", "-o", help="GitHub org to scan"),
-    user: Optional[str] = typer.Option(None, "--user", "-u", help="Scan personal repos for the authenticated user"),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="GitHub username to scan (use 'me' or omit username for the authenticated user)"),
     token: Optional[str] = typer.Option(
         None, "--token", "-t",
         help="GitHub token (defaults to gh CLI, then GITHUB_TOKEN env var)",
@@ -487,11 +487,12 @@ def scan(
                 err_console.print(f"[yellow]Code search failed for org {org}: {exc}[/yellow]")
 
         if user:
-            console.print(f"  Searching authenticated user's repos...")
+            user_scope = "@me" if user.lower() in ("me", "@me") else user
+            console.print(f"  Searching user: [bold]{user_scope}[/bold]")
             try:
-                fast_findings.extend(scanner.code_search_compromised(user="@me"))
+                fast_findings.extend(scanner.code_search_compromised(user=user_scope))
             except Exception as exc:
-                err_console.print(f"[yellow]Code search failed for user repos: {exc}[/yellow]")
+                err_console.print(f"[yellow]Code search failed for user {user_scope}: {exc}[/yellow]")
 
         if fast_findings:
             console.print(f"  [red]Found {len(fast_findings)} code search hit(s)![/red]")
@@ -520,13 +521,14 @@ def scan(
                 search_failed = True
 
         if user:
-            console.print(f"  Searching authenticated user's repos for litellm...")
+            user_scope = "@me" if user.lower() in ("me", "@me") else user
+            console.print(f"  Searching user [bold]{user_scope}[/bold] for litellm in dependency files...")
             try:
-                found = scanner.search_repos_with_litellm(user="@me")
+                found = scanner.search_repos_with_litellm(user=user_scope)
                 repos.update(found)
-                console.print(f"  [bold]{len(found)}[/bold] personal repo(s) reference litellm")
+                console.print(f"  [bold]{len(found)}[/bold] repo(s) reference litellm for {user_scope}")
             except Exception as exc:
-                err_console.print(f"[yellow]Filter search failed for user repos: {exc} — falling back to full user scan[/yellow]")
+                err_console.print(f"[yellow]Filter search failed for {user_scope}: {exc} — falling back to full user scan[/yellow]")
                 search_failed = True
 
         repos_with_litellm = len(repos)
@@ -541,9 +543,12 @@ def scan(
                     err_console.print(f"[red]Failed to list repos for {org}: {exc}[/red]")
             if user:
                 try:
-                    repos.update(scanner.iter_user_repos())
+                    if user.lower() in ("me", "@me"):
+                        repos.update(scanner.iter_user_repos())
+                    else:
+                        repos.update(scanner.iter_public_user_repos(user))
                 except Exception as exc:
-                    err_console.print(f"[red]Failed to list user repos: {exc}[/red]")
+                    err_console.print(f"[red]Failed to list repos for {user}: {exc}[/red]")
 
         total_repos_scanned = len(repos)
 

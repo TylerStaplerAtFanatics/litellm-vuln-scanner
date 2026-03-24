@@ -374,6 +374,22 @@ class GitHubScanner:
                 break
             page += 1
 
+    def iter_public_user_repos(self, username: str) -> Iterator[str]:
+        """Yield public repos for any GitHub user by username."""
+        page = 1
+        while True:
+            resp = self._get(f"/users/{username}/repos",
+                             params={"per_page": 100, "page": page, "type": "owner"})
+            resp.raise_for_status()
+            repos = resp.json()
+            if not repos:
+                break
+            for r in repos:
+                yield r["full_name"]
+            if len(repos) < 100:
+                break
+            page += 1
+
     # ── Code search (REST) ────────────────────────────────────────────────────
 
     def _code_search(self, query: str) -> list[dict]:
