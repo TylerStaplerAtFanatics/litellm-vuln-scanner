@@ -288,18 +288,27 @@ def _extract_versions(filepath: str, content: str) -> list[tuple[str, str]]:
                 results.append((m.group("ver") if m else "(script install, no pin)", line.strip()))
 
     elif basename in _DEPENDENCY_BASENAMES or filepath.startswith(".github/workflows/"):
-        # Dependency declarations and workflow YAML: report version pins and
-        # bare `litellm` dependency lines (completely unpinned).
+        # Dependency declarations and workflow YAML.
+        # Report:
+        #   - Open/unbounded constraints (>=, ~=, >, no version at all)
+        #   - Exact pins to COMPROMISED_VERSIONS
+        # Skip:
+        #   - Exact pins to safe versions (==X.Y.Z where X.Y.Z not compromised)
+        _EXACT_PIN_RE = re.compile(r"litellm\s*==\s*", re.IGNORECASE)
         for line in content.splitlines():
             stripped = line.strip()
             if "litellm" not in stripped.lower():
                 continue
-            # Skip comment lines
             if stripped.startswith(("#", "//", "--")):
                 continue
             m = _LITELLM_PIN_RE.search(stripped)
             if m:
-                results.append((m.group("ver"), stripped))
+                ver = m.group("ver")
+                is_exact = bool(_EXACT_PIN_RE.search(stripped))
+                if is_exact and ver not in COMPROMISED_VERSIONS:
+                    # Safe exact pin — no action needed
+                    continue
+                results.append((ver, stripped))
             elif re.match(r"^litellm\s*(?:\[.*?\])?\s*$", stripped, re.IGNORECASE):
                 # Bare `litellm` or `litellm[proxy]` with no version constraint
                 results.append(("(no version constraint)", stripped))
