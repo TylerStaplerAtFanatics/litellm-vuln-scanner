@@ -65,6 +65,33 @@ _LITELLM_PIN_RE = re.compile(
 )
 _LOCK_VERSION_RE = re.compile(r'^version\s*=\s*"(?P<ver>[^"]+)"', re.MULTILINE)
 
+# ── Log analysis patterns ──────────────────────────────────────────────────────
+
+# pip: "Successfully installed litellm-1.82.7 ..."
+_PIP_INSTALLED_RE = re.compile(
+    r"Successfully installed\b.*?\blitellm-(?P<ver>[0-9]+\.[0-9]+\.[0-9]+\S*)",
+    re.IGNORECASE,
+)
+# pip: "Collecting litellm==1.82.7" or "Downloading litellm-1.82.7"
+_PIP_COLLECTING_RE = re.compile(
+    r"(?:Collecting|Downloading)\s+litellm[-=](?P<ver>[0-9]+\.[0-9]+\.[0-9]+\S*)",
+    re.IGNORECASE,
+)
+# uv: "   + litellm==1.82.7" (uv sync/add output)
+_UV_ADDED_RE = re.compile(
+    r"\+\s+litellm[=@]?(?P<ver>[0-9]+\.[0-9]+\.[0-9]+\S*)",
+    re.IGNORECASE,
+)
+# Any line that clearly invokes a package installer with litellm
+_INSTALLER_CMD_RE = re.compile(
+    r"(?:pip|pip3|uv pip|uv sync|uv add|poetry install|pipenv install)"
+    r".*litellm|litellm.*(?:pip|uv)",
+    re.IGNORECASE,
+)
+
+# Lines to collect as context (cap to avoid huge output)
+_MAX_CONTEXT_LINES = 5
+
 
 # ── Rate limit handling ───────────────────────────────────────────────────────
 
@@ -112,6 +139,82 @@ class Finding:
 
 
 @dataclass
+class JobAnalysis:
+    """Log analysis for a single GitHub Actions job."""
+    job_id:           int
+    job_name:         str
+    job_url:          str
+    conclusion:       str | None
+    # Did the job install any Python packages at all?
+    ran_installer:    bool = False
+    # Was litellm specifically installed?
+    installed_litellm: bool = False
+    # Resolved version if we could determine it from log output
+    resolved_version: str | None = None
+    # Matching log lines (capped) for evidence
+    evidence_lines:   list[str] = field(default_factory=list)
+
+
+def analyze_log(log_text: str) -> tuple[bool, bool, str | None, list[str]]:
+    """
+    Parse raw job log text for litellm installation evidence.
+
+    Returns:
+        ran_installer:     True if any pip/uv/poetry invocation was detected
+        installed_litellm: True if litellm was specifically installed
+        resolved_version:  Version string if determinable from output
+        evidence_lines:    Relevant log lines (up to _MAX_CONTEXT_LINES)
+    """
+    ran_installer = False
+    installed_litellm = False
+    resolved_version: str | None = None
+    evidence: list[str] = []
+
+    for line in log_text.splitlines():
+        # Strip GitHub Actions timestamp prefix (e.g. "2026-03-23T10:00:00.0000000Z ")
+        clean = re.sub(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s*", "", line).strip()
+        if not clean:
+            continue
+
+        # Detect installer invocations
+        if _INSTALLER_CMD_RE.search(clean):
+            ran_installer = True
+            if len(evidence) < _MAX_CONTEXT_LINES:
+                evidence.append(clean)
+
+        # pip: successfully installed
+        m = _PIP_INSTALLED_RE.search(clean)
+        if m:
+            installed_litellm = True
+            resolved_version = m.group("ver")
+            if len(evidence) < _MAX_CONTEXT_LINES:
+                evidence.append(clean)
+            continue
+
+        # pip: collecting / downloading
+        m = _PIP_COLLECTING_RE.search(clean)
+        if m:
+            installed_litellm = True
+            if resolved_version is None:
+                resolved_version = m.group("ver")
+            if len(evidence) < _MAX_CONTEXT_LINES:
+                evidence.append(clean)
+            continue
+
+        # uv: + litellm==X
+        m = _UV_ADDED_RE.search(clean)
+        if m:
+            ran_installer = True
+            installed_litellm = True
+            if resolved_version is None:
+                resolved_version = m.group("ver")
+            if len(evidence) < _MAX_CONTEXT_LINES:
+                evidence.append(clean)
+
+    return ran_installer, installed_litellm, resolved_version, evidence
+
+
+@dataclass
 class WorkflowRunFinding:
     repo:          str
     workflow_name: str
@@ -120,6 +223,7 @@ class WorkflowRunFinding:
     started_at:    datetime
     conclusion:    str | None
     head_branch:   str
+    jobs:          list[JobAnalysis] = field(default_factory=list)
 
 
 @dataclass
@@ -407,9 +511,64 @@ class GitHubScanner:
             if item["name"].endswith((".yml", ".yaml"))
         ]
 
+    # ── Job log analysis ──────────────────────────────────────────────────────
+
+    def fetch_job_logs(self, repo: str, job_id: int) -> str:
+        """
+        Fetch plain-text log for a single job.
+        The API returns a 302 redirect; httpx follows it automatically.
+        Returns empty string on 404/403 (logs expired or no access).
+        """
+        resp = self._client.get(
+            f"/repos/{repo}/actions/jobs/{job_id}/logs",
+            follow_redirects=True,
+        )
+        if resp.status_code in (404, 403, 410):
+            return ""
+        resp.raise_for_status()
+        return resp.text
+
+    def analyze_run_jobs(
+        self, repo: str, run_id: int
+    ) -> list[JobAnalysis]:
+        """
+        List all jobs for a run, fetch their logs, and analyse each for
+        evidence of litellm installation.
+        """
+        resp = self._get(
+            f"/repos/{repo}/actions/runs/{run_id}/jobs",
+            params={"per_page": 100, "filter": "all"},
+        )
+        if resp.status_code in (403, 404):
+            return []
+        resp.raise_for_status()
+
+        analyses: list[JobAnalysis] = []
+        for job in resp.json().get("jobs", []):
+            job_id   = job["id"]
+            job_name = job.get("name", "")
+            job_url  = job.get("html_url", "")
+            conclusion = job.get("conclusion")
+
+            log_text = self.fetch_job_logs(repo, job_id)
+            ran_installer, installed_litellm, resolved_version, evidence = analyze_log(log_text)
+
+            analyses.append(JobAnalysis(
+                job_id=job_id,
+                job_name=job_name,
+                job_url=job_url,
+                conclusion=conclusion,
+                ran_installer=ran_installer,
+                installed_litellm=installed_litellm,
+                resolved_version=resolved_version,
+                evidence_lines=evidence,
+            ))
+
+        return analyses
+
     # ── Workflow run validation ────────────────────────────────────────────────
 
-    def check_workflow_runs(self, repo: str) -> list[WorkflowRunFinding]:
+    def check_workflow_runs(self, repo: str, check_logs: bool = True) -> list[WorkflowRunFinding]:
         """Return Actions runs that started during the compromise window."""
         created_filter = (
             f"{COMPROMISE_WINDOW_START.strftime('%Y-%m-%dT%H:%M:%SZ')}"
@@ -435,7 +594,8 @@ class GitHubScanner:
                     started_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
                 except (ValueError, AttributeError):
                     started_at = COMPROMISE_WINDOW_START
-                runs.append(WorkflowRunFinding(
+
+                run_finding = WorkflowRunFinding(
                     repo=repo,
                     workflow_name=run.get("name") or run.get("display_title", ""),
                     run_id=run["id"],
@@ -443,7 +603,10 @@ class GitHubScanner:
                     started_at=started_at,
                     conclusion=run.get("conclusion"),
                     head_branch=run.get("head_branch", ""),
-                ))
+                )
+                if check_logs:
+                    run_finding.jobs = self.analyze_run_jobs(repo, run["id"])
+                runs.append(run_finding)
             if len(batch) < 100:
                 break
             page += 1
@@ -470,7 +633,7 @@ class GitHubScanner:
                 ))
         return result
 
-    def scan_repo(self, repo: str, check_runs: bool = True) -> ScanResult:
+    def scan_repo(self, repo: str, check_runs: bool = True, check_logs: bool = True) -> ScanResult:
         """
         Scan a single repo. GraphQL is used for the main dependency files;
         REST fills in subdirectory paths and workflow files.
@@ -501,7 +664,7 @@ class GitHubScanner:
             for f in result.findings
         ):
             try:
-                result.workflow_runs = self.check_workflow_runs(repo)
+                result.workflow_runs = self.check_workflow_runs(repo, check_logs=check_logs)
             except httpx.HTTPStatusError:
                 pass
 

@@ -21,6 +21,7 @@ from .scanner import (
     COMPROMISE_WINDOW_START,
     COMPROMISE_WINDOW_END,
     COMPROMISED_VERSIONS,
+    JobAnalysis,
 )
 
 app = typer.Typer(
@@ -140,26 +141,64 @@ def _build_report(
         lines.append("")
 
     if ci_runs:
+        any_compromised_ci = any(
+            job.resolved_version in COMPROMISED_VERSIONS
+            for run in ci_runs for job in run.jobs if job.resolved_version
+        )
+        any_litellm_ci = any(job.installed_litellm for run in ci_runs for job in run.jobs)
+
+        section_icon = "🚨" if any_compromised_ci else ("⚠️" if any_litellm_ci else "🔍")
         lines += [
-            "## 🔍 CI Runs During Compromise Window",
+            f"## {section_icon} CI Runs During Compromise Window",
             "",
-            f"The following GitHub Actions runs executed between "
-            f"**{COMPROMISE_WINDOW_START.strftime('%Y-%m-%d %H:%M UTC')}** and "
-            f"**{COMPROMISE_WINDOW_END.strftime('%Y-%m-%d %H:%M UTC')}**",
+            f"Runs between **{COMPROMISE_WINDOW_START.strftime('%Y-%m-%d %H:%M UTC')}** "
+            f"and **{COMPROMISE_WINDOW_END.strftime('%Y-%m-%d %H:%M UTC')}** "
             "on repos with unbounded litellm dependencies.",
-            "Review each run's logs to confirm the resolved litellm version.",
             "",
-            "| Repo | Workflow | Branch | Started | Conclusion | Link |",
-            "|------|----------|--------|---------|------------|------|",
         ]
+
+        if any_compromised_ci:
+            lines += [
+                "> **CRITICAL**: A compromised litellm version was confirmed installed by CI.",
+                "> Rotate all secrets accessible from affected environments immediately.",
+                "",
+            ]
+
         for run in ci_runs:
-            lines.append(
-                f"| `{run.repo}` | {run.workflow_name} | `{run.head_branch}` "
-                f"| {run.started_at.strftime('%Y-%m-%d %H:%M')} "
-                f"| {run.conclusion or 'in-progress'} "
-                f"| [view]({run.run_url}) |"
-            )
-        lines.append("")
+            litellm_jobs = [j for j in run.jobs if j.installed_litellm]
+            status_icon = "🚨" if any(
+                j.resolved_version in COMPROMISED_VERSIONS for j in litellm_jobs if j.resolved_version
+            ) else ("⚠️" if litellm_jobs else "ℹ️")
+
+            lines += [
+                f"### {status_icon} [{run.repo}]({run.run_url}) — {run.workflow_name}",
+                "",
+                f"- **Branch**: `{run.head_branch}`",
+                f"- **Started**: {run.started_at.strftime('%Y-%m-%d %H:%M UTC')}",
+                f"- **Conclusion**: {run.conclusion or 'in-progress'}",
+                f"- **Run URL**: {run.run_url}",
+                "",
+            ]
+
+            if run.jobs:
+                lines += [
+                    "| Job | pip/uv ran? | litellm installed? | Version | Evidence |",
+                    "|-----|------------|-------------------|---------|----------|",
+                ]
+                for job in run.jobs:
+                    ver = job.resolved_version or "—"
+                    ver_fmt = f"**{ver}** ⛔" if ver in COMPROMISED_VERSIONS else ver
+                    evidence = "; ".join(job.evidence_lines[:2])[:120] if job.evidence_lines else "—"
+                    lines.append(
+                        f"| [{job.job_name}]({job.job_url}) "
+                        f"| {'yes' if job.ran_installer else 'no'} "
+                        f"| {'**YES**' if job.installed_litellm else 'no'} "
+                        f"| `{ver_fmt}` "
+                        f"| `{evidence}` |"
+                    )
+                lines.append("")
+            else:
+                lines += ["*(Log analysis unavailable for this run)*", ""]
     elif unpinned:
         lines += [
             "## ✅ CI Runs During Compromise Window",
@@ -261,41 +300,99 @@ def _print_results(
             f"{COMPROMISE_WINDOW_START.strftime('%Y-%m-%d %H:%M UTC')} – "
             f"{COMPROMISE_WINDOW_END.strftime('%Y-%m-%d %H:%M UTC')}"
         )
-        console.print(f"\n[bold red]⚠  CI RUNS DURING COMPROMISE WINDOW ({window}):[/bold red]")
-        console.print(
-            "  These repos ran GitHub Actions while the bad packages were live on PyPI.\n"
-            "  If a workflow ran [italic]pip install[/italic] / [italic]uv sync[/italic] "
-            "it may have pulled the compromised version.\n"
+        # Determine worst-case across all runs
+        any_litellm_installed = any(
+            job.installed_litellm
+            for _, runs in runs_with_findings
+            for run in runs
+            for job in run.jobs
         )
-        t = Table(show_header=True, header_style="bold red")
-        t.add_column("Repo", style="bold")
-        t.add_column("Workflow")
-        t.add_column("Branch")
-        t.add_column("Started At")
-        t.add_column("Conclusion")
-        t.add_column("Run URL")
-        for result, runs in runs_with_findings:
+        any_compromised_version = any(
+            job.resolved_version in COMPROMISED_VERSIONS
+            for _, runs in runs_with_findings
+            for run in runs
+            for job in run.jobs
+            if job.resolved_version
+        )
+
+        header_color = "bold red" if any_compromised_version else (
+            "bold yellow" if any_litellm_installed else "bold yellow"
+        )
+        console.print(f"\n[{header_color}]⚠  CI RUNS DURING COMPROMISE WINDOW ({window}):[/{header_color}]")
+
+        for scan_result, runs in runs_with_findings:
             for run in runs:
-                conclusion_color = {
-                    "success": "green",
-                    "failure": "red",
-                    "cancelled": "dim",
-                }.get(run.conclusion or "", "yellow")
-                t.add_row(
-                    result.repo,
-                    run.workflow_name[:40],
-                    run.head_branch,
-                    run.started_at.strftime("%Y-%m-%d %H:%M UTC"),
-                    f"[{conclusion_color}]{run.conclusion or 'in-progress'}[/{conclusion_color}]",
-                    run.run_url,
+                has_jobs = bool(run.jobs)
+                litellm_jobs = [j for j in run.jobs if j.installed_litellm]
+                run_color = "red" if any(
+                    j.resolved_version in COMPROMISED_VERSIONS for j in litellm_jobs if j.resolved_version
+                ) else ("yellow" if litellm_jobs else "dim")
+
+                conclusion_color = {"success": "green", "failure": "red", "cancelled": "dim"}.get(
+                    run.conclusion or "", "yellow"
                 )
-        console.print(t)
-        console.print(
-            "\n[bold]Next steps for affected repos:[/bold]\n"
-            "  1. Review the workflow YAML to confirm if pip/uv install ran\n"
-            "  2. Check the run logs for the resolved litellm version\n"
-            "  3. If 1.82.7 or 1.82.8 was installed — [bold red]rotate all secrets immediately[/bold red]\n"
-        )
+                console.print(
+                    f"\n  [{run_color}]● {scan_result.repo}[/{run_color}]  "
+                    f"[dim]{run.workflow_name[:60]}[/dim]  "
+                    f"branch=[italic]{run.head_branch}[/italic]  "
+                    f"started={run.started_at.strftime('%Y-%m-%d %H:%M UTC')}  "
+                    f"[{conclusion_color}]{run.conclusion or 'in-progress'}[/{conclusion_color}]  "
+                    f"[link={run.run_url}]view run[/link]"
+                )
+
+                if not has_jobs:
+                    console.print("    [dim](log analysis unavailable)[/dim]")
+                    continue
+
+                # Print job-level detail
+                t = Table(show_header=True, header_style="dim", box=None, padding=(0, 2))
+                t.add_column("Job")
+                t.add_column("pip/uv ran?")
+                t.add_column("litellm installed?")
+                t.add_column("Version")
+                t.add_column("Evidence")
+
+                for job in run.jobs:
+                    pip_ran   = "[green]yes[/green]" if job.ran_installer else "[dim]no[/dim]"
+                    installed = "[bold red]YES[/bold red]" if job.installed_litellm else "[dim]no[/dim]"
+                    ver_str   = f"[{'red' if job.resolved_version in COMPROMISED_VERSIONS else 'green'}]{job.resolved_version}[/{'red' if job.resolved_version in COMPROMISED_VERSIONS else 'green'}]" if job.resolved_version else "[dim]—[/dim]"
+                    evidence  = ("\n".join(job.evidence_lines[:2]))[:80] if job.evidence_lines else "—"
+                    t.add_row(job.job_name[:40], pip_ran, installed, ver_str, evidence)
+
+                console.print(t)
+
+                if litellm_jobs:
+                    for job in litellm_jobs:
+                        if job.resolved_version in COMPROMISED_VERSIONS:
+                            console.print(
+                                f"    [bold red]CONFIRMED: litellm {job.resolved_version} "
+                                f"was installed by job '{job.job_name}' — ROTATE ALL SECRETS[/bold red]"
+                            )
+                        elif job.resolved_version:
+                            console.print(
+                                f"    [green]litellm {job.resolved_version} installed "
+                                f"(not a compromised version)[/green]"
+                            )
+                        else:
+                            console.print(
+                                f"    [yellow]litellm installation detected in job '{job.job_name}' "
+                                f"but version could not be determined — inspect logs manually[/yellow]"
+                            )
+
+        if any_compromised_version:
+            console.print(
+                "\n[bold red]CRITICAL: Compromised litellm version was installed via CI.\n"
+                "Rotate ALL secrets immediately.[/bold red]\n"
+            )
+        elif any_litellm_installed:
+            console.print(
+                "\n[yellow]litellm was installed during the window but no compromised version detected.[/yellow]\n"
+            )
+        else:
+            console.print(
+                "\n[green]CI ran during the window but no litellm installation detected in job logs.[/green]\n"
+            )
+
     elif any(f.kind == FindingKind.UNPINNED for r in results for f in r.findings):
         console.print(
             "\n[green]✓ No CI runs detected during the compromise window "
@@ -353,6 +450,10 @@ def scan(
     check_runs: bool = typer.Option(
         True, "--check-runs/--no-check-runs",
         help="Check GitHub Actions runs during the compromise window for repos with unbounded litellm deps",
+    ),
+    check_logs: bool = typer.Option(
+        True, "--check-logs/--no-check-logs",
+        help="Fetch and analyse job logs for CI runs in the compromise window (slower but definitive)",
     ),
     report: Optional[Path] = typer.Option(
         None, "--report", "-r",
@@ -451,7 +552,7 @@ def scan(
 
         results: list[ScanResult] = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(scanner.scan_repo, repo, check_runs): repo for repo in repos}
+            futures = {pool.submit(scanner.scan_repo, repo, check_runs, check_logs): repo for repo in repos}
             with console.status("[dim]Scanning...[/dim]") as status:
                 for done in as_completed(futures):
                     repo = futures[done]
