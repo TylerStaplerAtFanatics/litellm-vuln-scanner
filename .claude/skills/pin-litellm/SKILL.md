@@ -18,8 +18,9 @@ Reference: https://github.com/BerriAI/litellm/issues/24518
 For each repo with an unpinned or compromised litellm finding, this skill:
 1. Determines which files need modification and what change to make
 2. Clones the repo to a temp directory
-3. Applies the constraint fix
+3. Applies the constraint fix + regenerates lockfiles
 4. Creates a branch, commits, and opens a PR
+5. **Launches a background task to monitor CI checks and review comments** — the skill is not done until all checks pass and all review feedback is addressed
 
 ## Safe Version Constraint
 
@@ -181,19 +182,92 @@ wait
 echo "All PRs created."
 ```
 
-## Verification After PRs
+### 5. Regenerate Lockfiles
 
-After creating PRs, verify they're open:
+**Always regenerate and commit lockfiles** — without this, `uv sync --frozen` or
+cached CI installs will continue using the old (potentially unsafe) resolved version.
 
 ```bash
-gh pr list --search "security pin-litellm" --json url,title,state,repo
+# uv projects
+uv lock
+git add uv.lock
+
+# poetry projects
+poetry lock --no-update
+git add poetry.lock
 ```
+
+Include the updated lockfile in the same commit as the pyproject.toml change.
+
+### 6. Create the PR
+
+Use the template from Step 3. Make sure PR **title and body both reference `==1.82.6`** —
+mismatches between the description and the code will be flagged by automated reviewers
+and cause unnecessary back-and-forth.
+
+### 7. Monitor CI and Review Feedback (Background Task)
+
+**The skill is not complete until all checks pass and all review threads are resolved.**
+After opening each PR, launch a background monitoring loop:
+
+```bash
+REPO="org/repo-name"
+PR_NUMBER=<number>
+
+# Poll until checks complete and no open review threads remain
+while true; do
+  # Check CI status
+  STATUS=$(gh pr view $PR_NUMBER --repo $REPO \
+    --json statusCheckRollup --jq '.statusCheckRollup | map(.conclusion) | unique | @csv')
+  echo "CI status: $STATUS"
+
+  # Check for unresolved inline review comments
+  OPEN_COMMENTS=$(gh api repos/$REPO/pulls/$PR_NUMBER/comments \
+    --jq '[.[] | select(.resolved == false or .resolved == null)] | length')
+  echo "Open review comments: $OPEN_COMMENTS"
+
+  # Also check for review-requested-changes state
+  REVIEW_STATE=$(gh pr view $PR_NUMBER --repo $REPO \
+    --json reviews --jq '[.reviews[] | select(.state == "CHANGES_REQUESTED")] | length')
+
+  if [[ "$STATUS" == *"FAILURE"* ]] || [[ "$STATUS" == *"failure"* ]]; then
+    echo "CI FAILED — fetch logs and fix:"
+    gh run list --repo $REPO --json databaseId,status,conclusion,url \
+      --jq '[.[] | select(.conclusion == "failure")] | .[0].url'
+    break  # exit loop to investigate and fix
+  fi
+
+  if [[ "$OPEN_COMMENTS" -gt 0 ]] || [[ "$REVIEW_STATE" -gt 0 ]]; then
+    echo "$OPEN_COMMENTS open comment(s) / $REVIEW_STATE change request(s) — address them:"
+    gh api repos/$REPO/pulls/$PR_NUMBER/comments \
+      --jq '[.[] | {author: .user.login, body: .body, path: .path}]'
+    break  # exit loop to address feedback
+  fi
+
+  if [[ "$STATUS" == *"SUCCESS"* ]] || [[ "$STATUS" == *"success"* ]]; then
+    echo "All checks passed, no open comments — PR is ready to merge."
+    break
+  fi
+
+  echo "Waiting for checks to complete..."
+  sleep 60
+done
+```
+
+**When CI fails**: fetch the failed job logs, fix the root cause (e.g. wrong version,
+missing lockfile update, import errors), amend the commit, force-push, and wait again.
+
+**When review comments appear**: read each comment, apply the fix if valid, or reply
+with a clear explanation if declining. Update the PR description to stay consistent
+with the code.
+
+**The workflow is complete only when**:
+- All CI checks show ✅ success
+- Zero unresolved inline review comments
+- PR title, body, and code all reference the same version
 
 ## Notes
 
 - Always `git diff` before committing to confirm only litellm constraints changed
-- If a repo uses `uv.lock` or `poetry.lock`, regenerate the lockfile after updating constraints:
-  - uv: `uv lock` then `git add uv.lock`
-  - poetry: `poetry lock --no-update` then `git add poetry.lock`
-- For repos with CI, the PR will trigger a test run — monitor for failures
-- Repos using `uv tool install` install litellm globally (not in lockfile) — the Makefile fix is the only mitigation
+- Repos using `uv tool install` install litellm globally (not in lockfile) — the Makefile fix is the only mitigation; no lockfile to regenerate
+- On macOS, use `sed -i ''` (BSD sed); on Linux use `sed -i` (GNU sed)
