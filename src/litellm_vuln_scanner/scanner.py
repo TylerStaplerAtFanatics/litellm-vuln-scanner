@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Iterator
 
@@ -13,6 +14,12 @@ import httpx
 # Versions confirmed compromised via PyPI supply chain attack (2026-03-23)
 # Reference: https://github.com/BerriAI/litellm/issues/24518
 COMPROMISED_VERSIONS = {"1.82.7", "1.82.8"}
+
+# Window during which the compromised packages were live on PyPI.
+# Start: when v1.82.7 was first published (2026-03-23)
+# End:   conservative end of exposure window (2026-03-24 EOD UTC)
+COMPROMISE_WINDOW_START = datetime(2026, 3, 23, 0, 0, 0, tzinfo=timezone.utc)
+COMPROMISE_WINDOW_END   = datetime(2026, 3, 25, 0, 0, 0, tzinfo=timezone.utc)
 
 # Dependency files to scan in each repo
 DEPENDENCY_FILES = [
@@ -63,10 +70,23 @@ class Finding:
 
 
 @dataclass
+class WorkflowRunFinding:
+    """A GitHub Actions run that executed during the compromise window."""
+    repo: str
+    workflow_name: str
+    run_id: int
+    run_url: str
+    started_at: datetime
+    conclusion: str | None   # "success", "failure", "cancelled", None (in-progress)
+    head_branch: str
+
+
+@dataclass
 class ScanResult:
     repo: str
     findings: list[Finding] = field(default_factory=list)
     scanned_files: list[str] = field(default_factory=list)
+    workflow_runs: list[WorkflowRunFinding] = field(default_factory=list)
     error: str | None = None
 
 
@@ -240,8 +260,77 @@ class GitHubScanner:
             if item["name"].endswith((".yml", ".yaml"))
         ]
 
-    def scan_repo(self, repo: str) -> ScanResult:
-        """Scan a single repo for all known dependency file paths."""
+    # ── Workflow run validation ────────────────────────────────────────────────
+
+    def check_workflow_runs(self, repo: str) -> list[WorkflowRunFinding]:
+        """
+        Return any GitHub Actions runs for *repo* that started during the
+        compromise window (2026-03-23 00:00 UTC – 2026-03-25 00:00 UTC).
+
+        A workflow run during this window on a repo with an unbounded litellm
+        dependency means pip/uv may have resolved to the compromised version.
+        """
+        created_filter = (
+            f"{COMPROMISE_WINDOW_START.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+            f".."
+            f"{COMPROMISE_WINDOW_END.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        )
+        runs: list[WorkflowRunFinding] = []
+        page = 1
+
+        while True:
+            resp = self._client.get(
+                f"/repos/{repo}/actions/runs",
+                params={
+                    "created": created_filter,
+                    "per_page": 100,
+                    "page": page,
+                },
+            )
+            if resp.status_code in (403, 404):
+                break
+            resp.raise_for_status()
+
+            data = resp.json()
+            batch = data.get("workflow_runs", [])
+            if not batch:
+                break
+
+            for run in batch:
+                started_raw = run.get("run_started_at") or run.get("created_at", "")
+                try:
+                    started_at = datetime.fromisoformat(
+                        started_raw.replace("Z", "+00:00")
+                    )
+                except (ValueError, AttributeError):
+                    started_at = COMPROMISE_WINDOW_START  # fallback
+
+                runs.append(
+                    WorkflowRunFinding(
+                        repo=repo,
+                        workflow_name=run.get("name") or run.get("display_title", ""),
+                        run_id=run["id"],
+                        run_url=run.get("html_url", ""),
+                        started_at=started_at,
+                        conclusion=run.get("conclusion"),
+                        head_branch=run.get("head_branch", ""),
+                    )
+                )
+
+            if len(batch) < 100:
+                break
+            page += 1
+
+        return runs
+
+    def scan_repo(self, repo: str, check_runs: bool = True) -> ScanResult:
+        """
+        Scan a single repo for all known dependency file paths.
+
+        When *check_runs* is True (default), repos with COMPROMISED or UNPINNED
+        findings are also checked for GitHub Actions runs during the compromise
+        window to determine if the bad version may have been installed.
+        """
         result = ScanResult(repo=repo)
 
         # Build the list of files to scan (static + dynamic workflow list)
@@ -278,5 +367,16 @@ class GitHubScanner:
                         raw_line=raw_line,
                     )
                 )
+
+        # For repos with concerning findings, check whether CI ran during the
+        # compromise window — those runs may have pip-installed the bad version.
+        if check_runs and any(
+            f.kind in (FindingKind.COMPROMISED, FindingKind.UNPINNED)
+            for f in result.findings
+        ):
+            try:
+                result.workflow_runs = self.check_workflow_runs(repo)
+            except httpx.HTTPStatusError:
+                pass
 
         return result

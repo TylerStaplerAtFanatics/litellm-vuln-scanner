@@ -38,15 +38,24 @@ If you find `litellm_init.pth`, **treat the machine as compromised** and rotate 
 
 ## Installation
 
-```bash
-# From PyPI (once published)
-pip install litellm-vuln-scanner
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
-# From source
+```bash
+# Run directly without installing (fastest)
+uvx --from git+https://github.com/TylerStaplerAtFanatics/litellm-vuln-scanner litellm-scan --help
+
+# Install as a persistent uv tool
+uv tool install git+https://github.com/TylerStaplerAtFanatics/litellm-vuln-scanner
+litellm-scan --help
+
+# From source (for development)
 git clone https://github.com/TylerStaplerAtFanatics/litellm-vuln-scanner
 cd litellm-vuln-scanner
-pip install -e .
+uv sync
+uv run litellm-scan --help
 ```
+
+All dependencies are strictly pinned in `uv.lock` for reproducible, trustworthy installs.
 
 ## Usage
 
@@ -69,6 +78,9 @@ litellm-scan --org fanatics-gaming --fast
 
 # Show all findings including unpinned constraints and lockfile versions
 litellm-scan --org fanatics-gaming --show-all
+
+# Skip checking GitHub Actions run history (faster, less thorough)
+litellm-scan --org fanatics-gaming --no-check-runs
 ```
 
 ## Output
@@ -80,6 +92,9 @@ The scanner reports three finding types:
 | `COMPROMISED` | Exact pin to 1.82.7 or 1.82.8 | Immediate: rotate secrets, upgrade |
 | `UNPINNED` | `litellm>=X` with no upper bound | Check if installed between 2026-03-23/24 |
 | `LOCKFILE` | Version resolved in poetry.lock / uv.lock | Review resolved version |
+| CI run alert | Workflow ran during compromise window | Inspect run logs for resolved version |
+
+For repos with `UNPINNED` dependencies, the scanner also checks GitHub Actions history. Any workflow run between **2026-03-23 and 2026-03-25 UTC** is flagged — those runs may have resolved `pip install litellm` to the compromised version. Inspect the run logs to confirm the actual resolved version.
 
 Exit code is `1` if any `COMPROMISED` findings are present, `0` otherwise (useful in CI).
 

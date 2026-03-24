@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.table import Table
 from rich import print as rprint
 
-from .scanner import FindingKind, GitHubScanner, ScanResult
+from .scanner import FindingKind, GitHubScanner, ScanResult, COMPROMISE_WINDOW_START, COMPROMISE_WINDOW_END
 
 app = typer.Typer(
     name="litellm-scan",
@@ -104,6 +104,60 @@ def _print_results(results: list[ScanResult], show_all: bool) -> int:
             f"(run with --show-all to see details)[/yellow]"
         )
 
+    # ── Workflow runs during compromise window ────────────────────────────────
+    runs_with_findings = [(r, r.workflow_runs) for r in results if r.workflow_runs]
+    if runs_with_findings:
+        window = (
+            f"{COMPROMISE_WINDOW_START.strftime('%Y-%m-%d %H:%M UTC')} – "
+            f"{COMPROMISE_WINDOW_END.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+        console.print(
+            f"\n[bold red]⚠  CI RUNS DURING COMPROMISE WINDOW ({window}):[/bold red]"
+        )
+        console.print(
+            "  These repos ran GitHub Actions while the bad packages were live on PyPI.\n"
+            "  If a workflow ran [italic]pip install[/italic] / [italic]uv sync[/italic] "
+            "it may have pulled the compromised version.\n"
+        )
+        t = Table(show_header=True, header_style="bold red")
+        t.add_column("Repo", style="bold")
+        t.add_column("Workflow")
+        t.add_column("Branch")
+        t.add_column("Started At")
+        t.add_column("Conclusion")
+        t.add_column("Run URL")
+        for result, runs in runs_with_findings:
+            for run in runs:
+                conclusion_color = {
+                    "success": "green",
+                    "failure": "red",
+                    "cancelled": "dim",
+                }.get(run.conclusion or "", "yellow")
+                t.add_row(
+                    result.repo,
+                    run.workflow_name[:40],
+                    run.head_branch,
+                    run.started_at.strftime("%Y-%m-%d %H:%M UTC"),
+                    f"[{conclusion_color}]{run.conclusion or 'in-progress'}[/{conclusion_color}]",
+                    run.run_url,
+                )
+        console.print(t)
+        console.print(
+            "\n[bold]Next steps for affected repos:[/bold]\n"
+            "  1. Review the workflow YAML to confirm if pip/uv install ran\n"
+            "  2. Check the run logs for the resolved litellm version\n"
+            "  3. If 1.82.7 or 1.82.8 was installed — [bold red]rotate all secrets immediately[/bold red]\n"
+        )
+    elif any(
+        f.kind == FindingKind.UNPINNED
+        for r in results for f in r.findings
+    ):
+        console.print(
+            "\n[green]✓ No CI runs detected during the compromise window "
+            f"({COMPROMISE_WINDOW_START.strftime('%Y-%m-%d')} – "
+            f"{COMPROMISE_WINDOW_END.strftime('%Y-%m-%d')})[/green]"
+        )
+
     # ── Lock file findings ────────────────────────────────────────────────────
     if lockfile and show_all:
         console.print("\n[dim]Lock file entries:[/dim]")
@@ -150,6 +204,10 @@ def scan(
     show_all: bool = typer.Option(
         False, "--show-all", "-a",
         help="Show all findings including unpinned constraints and lockfile entries",
+    ),
+    check_runs: bool = typer.Option(
+        True, "--check-runs/--no-check-runs",
+        help="Check GitHub Actions runs during the compromise window for repos with unbounded litellm deps",
     ),
 ):
     """
@@ -217,7 +275,7 @@ def scan(
 
         results: list[ScanResult] = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(scanner.scan_repo, repo): repo for repo in repos}
+            futures = {pool.submit(scanner.scan_repo, repo, check_runs): repo for repo in repos}
             with console.status("[dim]Scanning...[/dim]") as status:
                 for done in as_completed(futures):
                     repo = futures[done]
