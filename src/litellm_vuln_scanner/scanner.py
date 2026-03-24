@@ -34,6 +34,8 @@ DEPENDENCY_FILES = [
     "Pipfile.lock",
     "poetry.lock",
     "uv.lock",
+    # Script/Makefile installs (e.g. `uv tool install litellm[proxy]`)
+    "Makefile",
 ]
 
 # Basenames used to filter broad code-search results client-side
@@ -52,6 +54,7 @@ _GRAPHQL_FILES = [
     "Pipfile.lock",
     "poetry.lock",
     "uv.lock",
+    "Makefile",
 ]
 
 # Repos fetched per GraphQL batch request.
@@ -88,6 +91,17 @@ _INSTALLER_CMD_RE = re.compile(
     r".*litellm|litellm.*(?:pip|uv)",
     re.IGNORECASE,
 )
+
+# Script/Makefile: `uv tool install litellm[proxy]`, `pip install litellm`, etc.
+# These indicate litellm is installed as a system tool (no lockfile), making
+# version pinning impossible to verify from the repo alone.
+_SCRIPT_INSTALL_RE = re.compile(
+    r"(?:uv\s+tool\s+(?:install|run)|pip3?\s+install|poetry\s+add)\s+\S*litellm",
+    re.IGNORECASE,
+)
+
+# Basenames of files where script-install patterns are meaningful
+_SCRIPT_BASENAMES = {"Makefile", "makefile"}
 
 # Lines to collect as context (cap to avoid huge output)
 _MAX_CONTEXT_LINES = 5
@@ -242,22 +256,55 @@ def _decode_content(encoded: str) -> str:
 
 
 def _extract_versions(filepath: str, content: str) -> list[tuple[str, str]]:
-    """Return [(version_or_constraint, raw_line), ...] for litellm entries."""
+    """
+    Return [(version_or_constraint, raw_line), ...] for litellm entries.
+
+    Rules per file type:
+    - Lock files (uv.lock, poetry.lock): extract the resolved version block
+    - Makefile / .sh scripts: only report lines that invoke an installer
+    - Dependency declarations (requirements.txt, pyproject.toml, etc.):
+        only report lines with an actual version specifier
+    - Everything else (README, docs, configs): skip — no actionable findings
+    """
     results: list[tuple[str, str]] = []
+    basename = filepath.split("/")[-1]
 
     if "poetry.lock" in filepath or "uv.lock" in filepath:
+        # Extract the locked version from the package block
         for block in re.finditer(
             r'name\s*=\s*"litellm".*?(?=\n\[\[|\n\[|\Z)', content, re.DOTALL
         ):
             ver = _LOCK_VERSION_RE.search(block.group())
             if ver:
                 results.append((ver.group("ver"), block.group()[:120]))
-    else:
+
+    elif basename in _SCRIPT_BASENAMES or filepath.endswith(".sh"):
+        # Makefile / shell scripts: only flag actual install invocations
         for line in content.splitlines():
             if "litellm" not in line.lower():
                 continue
-            m = _LITELLM_PIN_RE.search(line)
-            results.append((m.group("ver") if m else "(unparsed)", line.strip()))
+            if _SCRIPT_INSTALL_RE.search(line):
+                m = _LITELLM_PIN_RE.search(line)
+                results.append((m.group("ver") if m else "(script install, no pin)", line.strip()))
+
+    elif basename in _DEPENDENCY_BASENAMES or filepath.startswith(".github/workflows/"):
+        # Dependency declarations and workflow YAML: report version pins and
+        # bare `litellm` dependency lines (completely unpinned).
+        for line in content.splitlines():
+            stripped = line.strip()
+            if "litellm" not in stripped.lower():
+                continue
+            # Skip comment lines
+            if stripped.startswith(("#", "//", "--")):
+                continue
+            m = _LITELLM_PIN_RE.search(stripped)
+            if m:
+                results.append((m.group("ver"), stripped))
+            elif re.match(r"^litellm\s*(?:\[.*?\])?\s*$", stripped, re.IGNORECASE):
+                # Bare `litellm` or `litellm[proxy]` with no version constraint
+                results.append(("(no version constraint)", stripped))
+
+    # All other files (README, docs, config, etc.): no findings returned
 
     return results
 
@@ -414,18 +461,19 @@ class GitHubScanner:
 
     def search_repos_with_litellm(
         self, *, org: str | None = None, user: str | None = None
-    ) -> set[str]:
+    ) -> dict[str, set[str]]:
         """
-        Single broad code search for 'litellm' in the given scope, filtered
-        client-side to dependency-file basenames. Issues ONE query instead of
-        one-per-filename, keeping well within the 10 req/min search rate limit.
+        Broad code search for 'litellm' in any file in the given scope.
+        Returns {repo_full_name: {file_paths_where_litellm_was_found}} for
+        every repo that mentions litellm — docs, configs, scripts, dep files,
+        etc. — so the deep-scanner decides what's actionable.
+        Issues ONE query to stay within the 10 req/min search rate limit.
         """
         scope = f"org:{org}" if org else f"user:{user}"
-        repos: set[str] = set()
+        repos: dict[str, set[str]] = {}
         for item in self._code_search(f"litellm {scope}"):
-            basename = item["path"].split("/")[-1]
-            if basename in _DEPENDENCY_BASENAMES:
-                repos.add(item["repository"]["full_name"])
+            repo = item["repository"]["full_name"]
+            repos.setdefault(repo, set()).add(item["path"])
         return repos
 
     def code_search_compromised(
@@ -649,10 +697,17 @@ class GitHubScanner:
                 ))
         return result
 
-    def scan_repo(self, repo: str, check_runs: bool = True, check_logs: bool = True) -> ScanResult:
+    def scan_repo(
+        self,
+        repo: str,
+        check_runs: bool = True,
+        check_logs: bool = True,
+        extra_files: set[str] | None = None,
+    ) -> ScanResult:
         """
         Scan a single repo. GraphQL is used for the main dependency files;
-        REST fills in subdirectory paths and workflow files.
+        REST fills in subdirectory paths, workflow files, and any additional
+        paths surfaced by code search.
         When check_runs=True, repos with COMPROMISED or UNPINNED findings are
         also checked for Actions runs during the compromise window.
         """
@@ -661,6 +716,7 @@ class GitHubScanner:
         file_map = batch_result.get(repo, {})
 
         # Supplement: REST for subdirectory requirements paths + workflow files
+        # + any additional files from code search that aren't in _GRAPHQL_FILES
         extra_paths = [
             p for p in DEPENDENCY_FILES if p not in _GRAPHQL_FILES
         ]
@@ -668,6 +724,8 @@ class GitHubScanner:
             extra_paths += self._list_workflow_files(repo)
         except httpx.HTTPStatusError:
             pass
+        if extra_files:
+            extra_paths += [p for p in extra_files if p not in file_map]
 
         for path in extra_paths:
             if path not in file_map:

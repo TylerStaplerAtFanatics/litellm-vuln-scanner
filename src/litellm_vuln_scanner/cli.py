@@ -508,13 +508,16 @@ def scan(
         console.print("\n[bold cyan]Phase 2: Filtering repos with litellm via code search...[/bold cyan]")
 
         repos: set[str] = set()
+        extra_files_by_repo: dict[str, set[str]] = {}
         search_failed = False
 
         if org:
-            console.print(f"  Searching org [bold]{org}[/bold] for litellm in dependency files...")
+            console.print(f"  Searching org [bold]{org}[/bold] for litellm in any file...")
             try:
                 found = scanner.search_repos_with_litellm(org=org)
-                repos.update(found)
+                repos.update(found.keys())
+                for repo_name, paths in found.items():
+                    extra_files_by_repo.setdefault(repo_name, set()).update(paths)
                 console.print(f"  [bold]{len(found)}[/bold] repo(s) reference litellm in {org}")
             except Exception as exc:
                 err_console.print(f"[yellow]Filter search failed for {org}: {exc} — falling back to full org scan[/yellow]")
@@ -522,10 +525,12 @@ def scan(
 
         if user:
             user_scope = "@me" if user.lower() in ("me", "@me") else user
-            console.print(f"  Searching user [bold]{user_scope}[/bold] for litellm in dependency files...")
+            console.print(f"  Searching user [bold]{user_scope}[/bold] for litellm in any file...")
             try:
                 found = scanner.search_repos_with_litellm(user=user_scope)
-                repos.update(found)
+                repos.update(found.keys())
+                for repo_name, paths in found.items():
+                    extra_files_by_repo.setdefault(repo_name, set()).update(paths)
                 console.print(f"  [bold]{len(found)}[/bold] repo(s) reference litellm for {user_scope}")
             except Exception as exc:
                 err_console.print(f"[yellow]Filter search failed for {user_scope}: {exc} — falling back to full user scan[/yellow]")
@@ -557,7 +562,13 @@ def scan(
 
         results: list[ScanResult] = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(scanner.scan_repo, repo, check_runs, check_logs): repo for repo in repos}
+            futures = {
+                pool.submit(
+                    scanner.scan_repo, repo, check_runs, check_logs,
+                    extra_files_by_repo.get(repo),
+                ): repo
+                for repo in repos
+            }
             with console.status("[dim]Scanning...[/dim]") as status:
                 for done in as_completed(futures):
                     repo = futures[done]
