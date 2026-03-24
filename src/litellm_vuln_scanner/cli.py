@@ -457,7 +457,11 @@ def scan(
     ),
     report: Optional[Path] = typer.Option(
         None, "--report", "-r",
-        help="Write a markdown infosec report to this file path",
+        help=(
+            "Write a markdown infosec report. If a directory is given (or the path ends "
+            "with /), a timestamped filename is generated automatically: "
+            "litellm-scan-<scope>-<YYYYMMDD-HHMM>.md"
+        ),
     ),
 ):
     """
@@ -585,6 +589,18 @@ def scan(
                                 total_repos_scanned=total_repos_scanned)
 
     if report:
+        # Auto-generate a timestamped filename if a directory (or trailing /) was given
+        if report.is_dir() or str(report).endswith("/"):
+            scope_parts = []
+            if org:
+                scope_parts.append(org.replace("/", "-"))
+            if user and user.lower() not in ("me", "@me"):
+                scope_parts.append(user.replace("/", "-"))
+            elif user:
+                scope_parts.append("me")
+            scope = "-".join(scope_parts) or "scan"
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+            report = report / f"litellm-scan-{scope}-{timestamp}.md"
         md = _build_report(results, org=org, user=user,
                            repos_with_litellm=repos_with_litellm,
                            total_repos_scanned=total_repos_scanned)
