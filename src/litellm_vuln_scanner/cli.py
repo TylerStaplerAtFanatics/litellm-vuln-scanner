@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -608,6 +609,180 @@ def scan(
         console.print(f"[green]Report written to:[/green] {report}")
 
     raise typer.Exit(exit_code)
+
+
+@app.command(name="check-local")
+def check_local():
+    """
+    Check whether the current Python environment is actively compromised.
+
+    Searches for litellm_init.pth in all Python site-packages directories
+    (dropped by litellm 1.82.8; activates malware on every Python startup)
+    and checks installed litellm versions via uv and pip.
+
+    WARNING: This command starts Python. Because litellm_init.pth activates on
+    every Python startup, only run this after first confirming the file does not
+    exist using the shell one-liner (no Python required):
+
+      find ~/.local/lib ~/.pyenv/versions ~/.venv /usr/local/lib /usr/lib
+        -name litellm_init.pth 2>/dev/null
+    """
+    import site as _site
+    import sysconfig
+
+    compromised = False
+
+    # ── 1. Collect site-packages directories ──────────────────────────────────
+    console.print("\n[bold cyan]Checking Python site-packages for litellm_init.pth...[/bold cyan]")
+
+    sp_dirs: set[Path] = set()
+
+    # Active interpreter's site-packages (all schemes)
+    for scheme in sysconfig.get_scheme_names():
+        try:
+            p = Path(sysconfig.get_path("purelib", scheme))
+            if p.exists():
+                sp_dirs.add(p)
+        except Exception:
+            pass
+
+    try:
+        sp_dirs.update(Path(p) for p in _site.getsitepackages() if Path(p).exists())
+    except AttributeError:
+        pass  # Not available in virtualenvs without system site-packages
+
+    try:
+        usp = Path(_site.getusersitepackages())
+        if usp.exists():
+            sp_dirs.add(usp)
+    except AttributeError:
+        pass
+
+    # uv tool virtualenvs
+    try:
+        r = subprocess.run(
+            ["uv", "tool", "dir"], capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            uv_tool_dir = Path(r.stdout.strip())
+            for sp in uv_tool_dir.glob("*/lib/python*/site-packages"):
+                if sp.exists():
+                    sp_dirs.add(sp)
+    except Exception:
+        pass
+
+    pth_filename = "litellm_init.pth"
+    pth_found: list[Path] = []
+
+    # Check every known site-packages directory directly
+    for sp in sorted(sp_dirs):
+        pth = sp / pth_filename
+        if pth.exists():
+            pth_found.append(pth)
+
+    # Broad find over common root directories to catch venvs we might miss
+    search_roots = [
+        Path.home() / ".local" / "lib",
+        Path.home() / ".pyenv" / "versions",
+        Path.home() / ".venv",
+        Path("/usr/local/lib"),
+        Path("/usr/lib"),
+        Path("/opt/homebrew/lib"),
+    ]
+    for root in search_roots:
+        if not root.exists():
+            continue
+        try:
+            r = subprocess.run(
+                ["find", str(root), "-name", pth_filename],
+                capture_output=True, text=True, timeout=20,
+            )
+            for line in r.stdout.splitlines():
+                p = Path(line.strip())
+                if p not in pth_found:
+                    pth_found.append(p)
+        except Exception:
+            pass
+
+    if pth_found:
+        compromised = True
+        console.print(
+            "\n[bold red]🚨 CRITICAL: litellm_init.pth FOUND — ENVIRONMENT IS COMPROMISED[/bold red]"
+        )
+        for p in pth_found:
+            console.print(f"  [red]{p}[/red]")
+        console.print(
+            "\n[bold red]This file was dropped by litellm 1.82.8 and executes malicious code\n"
+            "on EVERY Python startup. Remove it immediately:[/bold red]\n"
+        )
+        for p in pth_found:
+            console.print(f"  [bold]rm {p}[/bold]")
+        console.print(
+            "\n[red]After removing, rotate ALL secrets this machine had access to.[/red]\n"
+        )
+    else:
+        console.print("[green]✓ litellm_init.pth not found in any site-packages[/green]")
+
+    # ── 2. Check installed litellm versions ───────────────────────────────────
+    console.print("\n[bold cyan]Checking installed litellm versions...[/bold cyan]")
+
+    try:
+        r = subprocess.run(
+            ["uv", "tool", "list"], capture_output=True, text=True, timeout=10
+        )
+        for line in r.stdout.splitlines():
+            if "litellm" not in line.lower():
+                continue
+            m = re.search(r"(\d+\.\d+\.\d+\S*)", line)
+            ver = m.group(1) if m else "unknown"
+            if ver in COMPROMISED_VERSIONS:
+                compromised = True
+                console.print(f"[bold red]🚨 uv tool: litellm {ver} (COMPROMISED)[/bold red]")
+                console.print(
+                    "  Remove:    [bold]uv tool uninstall litellm[/bold]\n"
+                    "  Reinstall: [bold]uv tool install \"litellm[proxy]==1.82.6\"[/bold]\n"
+                )
+            else:
+                console.print(f"[green]✓ uv tool: litellm {ver} (clean)[/green]")
+    except FileNotFoundError:
+        pass  # uv not installed
+
+    try:
+        r = subprocess.run(
+            ["pip", "show", "litellm"], capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            m = re.search(r"^Version:\s*(.+)$", r.stdout, re.MULTILINE)
+            if m:
+                ver = m.group(1).strip()
+                if ver in COMPROMISED_VERSIONS:
+                    compromised = True
+                    console.print(
+                        f"[bold red]🚨 pip (current env): litellm {ver} (COMPROMISED)[/bold red]\n"
+                        "  Downgrade: [bold]pip install \"litellm==1.82.6\"[/bold]\n"
+                    )
+                else:
+                    console.print(f"[green]✓ pip (current env): litellm {ver} (clean)[/green]")
+        else:
+            console.print("[dim]  litellm not installed in current pip environment[/dim]")
+    except FileNotFoundError:
+        pass
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    if compromised:
+        console.print(
+            "\n[bold red]╔══ COMPROMISED ENVIRONMENT DETECTED ══╗[/bold red]\n"
+            "[red]Do not run any scripts until you have:\n"
+            "  1. Removed litellm_init.pth from all site-packages (see above)\n"
+            "  2. Uninstalled/downgraded compromised litellm versions\n"
+            "  3. Rotated ALL secrets this machine had access to\n"
+            "  4. Checked cloud audit logs for unauthorized access[/red]\n"
+        )
+        raise typer.Exit(2)
+
+    console.print(
+        "\n[bold green]✓ No compromise indicators found in current Python environment.[/bold green]\n"
+    )
 
 
 if __name__ == "__main__":

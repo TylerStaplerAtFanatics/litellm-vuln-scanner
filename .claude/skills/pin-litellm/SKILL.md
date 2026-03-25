@@ -34,6 +34,44 @@ the attack (`1.82.9`+) exists yet — pin to `==1.82.6` in all cases.
 
 ## Step-by-Step Workflow
 
+### 0. Pre-flight Safety Check
+
+**`litellm_init.pth` activates on every Python startup** — including the Python process
+that runs this scanner. Always use the shell one-liner first; only run Python commands
+after it confirms the machine is clean.
+
+#### Step A: Shell one-liner — always run this first (no Python)
+
+```bash
+find \
+  ~/.local/lib ~/.pyenv/versions ~/.venv \
+  /usr/local/lib /usr/lib /opt/homebrew/lib \
+  -name "litellm_init.pth" 2>/dev/null \
+| while read f; do
+    echo "🚨 COMPROMISED: $f"
+    echo "   Remove with: rm '$f'"
+  done \
+&& echo "✓ litellm_init.pth not found"
+```
+
+Uses only `find` — does not start Python. Safe to run on any machine.
+
+#### Step B: Scanner CLI — only after Step A confirms clean
+
+```bash
+litellm-scan check-local
+```
+
+Checks all Python site-packages directories (active venv, user site, uv tool venvs,
+common system dirs), `uv tool list`, and `pip show litellm` for compromised versions
+(1.82.7, 1.82.8). Exits with code 0 (clean) or 2 (compromised).
+
+**If `litellm_init.pth` is found at any point:**
+1. Remove it immediately: `rm <path>`
+2. Rotate **all secrets** the machine had access to
+3. Check cloud audit logs for unauthorized API calls
+4. Search deployed containers/environments for the same file
+
 ### 1. Get Findings
 
 Either read an existing report file or run the scanner:

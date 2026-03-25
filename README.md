@@ -23,18 +23,34 @@ Data was encrypted (AES-256-CBC + RSA-4096) and POSTed to an attacker-controlled
 
 ## Quick Local Check
 
-Before scanning repos, verify your own machine:
+**`litellm_init.pth` activates on *every* Python startup** — including the startup that runs this scanner. Always use the shell one-liner first to confirm Python is clean before running any Python on the machine.
+
+### Step 1: Shell one-liner (no Python, always safe)
 
 ```bash
-# Check installed version
-pip show litellm
-
-# Look for the malicious .pth file (indicator of compromise)
-find $(python3 -c "import site; print(' '.join(site.getsitepackages()))") \
-  -name "litellm_init.pth" 2>/dev/null
+find \
+  ~/.local/lib ~/.pyenv/versions ~/.venv \
+  /usr/local/lib /usr/lib /opt/homebrew/lib \
+  -name "litellm_init.pth" 2>/dev/null \
+| while read f; do
+    echo "COMPROMISED: $f — remove with: rm '$f'"
+  done \
+&& echo "litellm_init.pth not found"
 ```
 
-If you find `litellm_init.pth`, **treat the machine as compromised** and rotate all secrets immediately.
+Uses only `find` — does not start Python. Safe to run on any machine.
+
+### Step 2: Scanner CLI (only after Step 1 confirms clean)
+
+```bash
+litellm-scan check-local
+```
+
+Checks all Python site-packages (active env, user site, uv tool venvs, common system dirs), `uv tool list`, and `pip show litellm` for compromised versions. Exit codes: `0` = clean, `2` = compromised.
+
+> **Note**: This command starts Python. Only run it after Step 1 confirms no `litellm_init.pth` exists on the machine.
+
+If `litellm_init.pth` is found at any point, **treat the machine as compromised**: remove the file, rotate all secrets, and check cloud audit logs.
 
 ## Installation
 
@@ -64,23 +80,26 @@ Requires a GitHub token with `repo` and `read:org` scopes. The tool will auto-de
 2. The `gh` CLI (`gh auth token`)
 
 ```bash
+# Check whether the local machine is compromised (run first)
+litellm-scan check-local
+
 # Scan an organization
-litellm-scan --org fanatics-gaming
+litellm-scan scan --org fanatics-gaming
 
 # Scan personal repos
-litellm-scan --user myusername
+litellm-scan scan --user myusername
 
 # Scan both
-litellm-scan --org fanatics-gaming --user myusername
+litellm-scan scan --org fanatics-gaming --user myusername
 
 # Fast mode: code search only (skips lockfile scanning)
-litellm-scan --org fanatics-gaming --fast
+litellm-scan scan --org fanatics-gaming --fast
 
 # Show all findings including unpinned constraints and lockfile versions
-litellm-scan --org fanatics-gaming --show-all
+litellm-scan scan --org fanatics-gaming --show-all
 
 # Skip checking GitHub Actions run history (faster, less thorough)
-litellm-scan --org fanatics-gaming --no-check-runs
+litellm-scan scan --org fanatics-gaming --no-check-runs
 ```
 
 ## Output
@@ -102,7 +121,7 @@ Exit code is `1` if any `COMPROMISED` findings are present, `0` otherwise (usefu
 
 If compromised versions are found:
 
-1. **Pin to a safe version**: `litellm>=1.82.9` or `litellm==1.82.6`
+1. **Pin to a safe version**: `litellm==1.82.6` (last confirmed clean version on PyPI)
 2. **Rotate all secrets** accessible from affected systems
 3. **Audit cloud provider logs** for unauthorized access
 4. **Check deployed environments** for `litellm_init.pth` in site-packages
